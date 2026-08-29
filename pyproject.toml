@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fastapi-mcp-server"
+version = "0.1.0"
+description = "A Model Context Protocol (MCP) server for FastAPI and Pydantic codebase introspection."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "FastAPI MCP Team" }
+]
+keywords = ["fastapi", "mcp", "pydantic", "model-context-protocol", "developer-tools", "ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "fastapi>=0.100.0",
+    "pydantic>=2.0.0",
+    "uvicorn>=0.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "basedpyright>=1.20.0",
+]
+
+[project.scripts]
+fastapi-mcp-server = "fastapi_mcp_server.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fastapi_mcp_server"]
+
+[tool.basedpyright]
+typeCheckingMode = "standard"
+pythonVersion = "3.10"
+venvPath = "."
+venv = ".venv"
+reportAny = false
+reportExplicitAny = false
+reportUnusedCallResult = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportUnknownParameterType = false
+reportMissingTypeStubs = false
+reportDeprecated = false
