@@ -1,15 +1,68 @@
-"""Dynamic module inspector and schema extractor for FastAPI and Pydantic targets."""
+"""Dynamic module inspector and schema extractor for FastAPI, APIRouter, and Pydantic targets."""
 
 import importlib
+import json
 import sys
 import traceback
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
 from starlette.routing import Mount, Route, WebSocketRoute
+
+from fastapi_mcp_server.codegen import json_schema_to_typescript, json_schema_to_zod
+
+
+def is_http_url(target_str: str) -> bool:
+    """Check if the given target string is a remote HTTP or HTTPS URL."""
+    return target_str.startswith(("http://", "https://"))
+
+
+def fetch_remote_openapi(url: str, timeout: float = 10.0) -> dict[str, Any]:
+    """
+    Fetch and parse the OpenAPI specification JSON from a live or deployed URL.
+    Automatically handles URLs pointing to /docs or root endpoints.
+    """
+    candidate_urls: list[str] = []
+    clean_url = url.strip()
+
+    if clean_url.endswith("/docs"):
+        candidate_urls.append(clean_url[:-5] + "/openapi.json")
+    elif clean_url.endswith("/openapi.json"):
+        candidate_urls.append(clean_url)
+    else:
+        candidate_urls.append(clean_url.rstrip("/") + "/openapi.json")
+        candidate_urls.append(clean_url)
+
+    last_error: Exception | None = None
+    for candidate in candidate_urls:
+        try:
+            req = urllib.request.Request(
+                candidate,
+                headers={
+                    "User-Agent": "fastapi-mcp-server/0.1.0",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                content = response.read().decode("utf-8")
+                data = json.loads(content)
+                if isinstance(data, dict) and (
+                    "openapi" in data or "swagger" in data or "paths" in data
+                ):
+                    return data
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            continue
+
+    return {
+        "error": "FetchError",
+        "detail": f"Failed to fetch OpenAPI JSON from '{url}'. Error: {last_error}",
+    }
 
 
 def normalize_import_path(
@@ -109,23 +162,40 @@ def resolve_target(target_str: str, project_dir: str | None = None) -> Any:
 
 
 def extract_openapi(app_path: str, project_dir: str | None = None) -> dict[str, Any]:
-    """Extract the OpenAPI specification dictionary from a FastAPI instance."""
+    """
+    Extract the OpenAPI specification dictionary from a FastAPI instance, APIRouter,
+    factory function, or a remote live/deployed HTTP URL.
+    """
+    # 1. Handle live URL
+    if is_http_url(app_path):
+        return fetch_remote_openapi(app_path)
+
+    # 2. Handle local Python target
     try:
         target = resolve_target(app_path, project_dir)
         app: FastAPI | None = None
 
         if isinstance(target, FastAPI):
             app = target
+        elif isinstance(target, APIRouter):
+            # Standalone router support: wrap inside a temporary FastAPI container
+            temp_app = FastAPI(title="Standalone Router Specification")
+            temp_app.include_router(target)
+            app = temp_app
         elif callable(target) and not isinstance(target, type):
-            # If it's a factory function, invoke it to obtain the FastAPI app
+            # If it's a factory function, invoke it to obtain the FastAPI app or router
             potential_app = target()
             if isinstance(potential_app, FastAPI):
                 app = potential_app
+            elif isinstance(potential_app, APIRouter):
+                temp_app = FastAPI(title="Factory Router Specification")
+                temp_app.include_router(potential_app)
+                app = temp_app
 
         if app is None:
             return {
                 "error": "TypeError",
-                "detail": f"Target '{app_path}' is {type(target).__name__}, expected a fastapi.FastAPI instance or factory function.",
+                "detail": f"Target '{app_path}' is {type(target).__name__}, expected a FastAPI app, APIRouter, or factory function.",
             }
 
         return app.openapi()
@@ -170,25 +240,83 @@ def extract_pydantic_schema(
         }
 
 
+def extract_routes_from_openapi(
+    openapi_dict: dict[str, Any],
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Extract a structured list of routes from an OpenAPI dictionary (e.g. from a remote URL)."""
+    if "error" in openapi_dict:
+        return openapi_dict
+
+    paths = openapi_dict.get("paths", {})
+    routes_info: list[dict[str, Any]] = []
+
+    for path, methods in paths.items():
+        if isinstance(methods, dict):
+            for method, operation in methods.items():
+                if method.lower() in (
+                    "get",
+                    "post",
+                    "put",
+                    "delete",
+                    "patch",
+                    "options",
+                    "head",
+                    "trace",
+                ):
+                    op_data = operation if isinstance(operation, dict) else {}
+                    routes_info.append(
+                        {
+                            "path": path,
+                            "name": op_data.get("operationId") or f"{method}_{path}",
+                            "methods": [method.upper()],
+                            "operation_id": op_data.get("operationId"),
+                            "summary": op_data.get("summary", ""),
+                            "description": op_data.get("description", ""),
+                            "tags": op_data.get("tags", []),
+                            "deprecated": bool(op_data.get("deprecated", False)),
+                            "type": "HTTP",
+                        }
+                    )
+
+    return routes_info
+
+
 def extract_routes(
     app_path: str, project_dir: str | None = None
 ) -> list[dict[str, Any]] | dict[str, Any]:
-    """Extract a simplified, structured list of all registered routes in a FastAPI application."""
+    """
+    Extract a simplified, structured list of all registered routes in a FastAPI application,
+    APIRouter, or live/deployed HTTP URL.
+    """
+    # 1. Handle live URL
+    if is_http_url(app_path):
+        openapi_res = fetch_remote_openapi(app_path)
+        return extract_routes_from_openapi(openapi_res)
+
+    # 2. Handle local Python target
     try:
         target = resolve_target(app_path, project_dir)
         app: FastAPI | None = None
 
         if isinstance(target, FastAPI):
             app = target
+        elif isinstance(target, APIRouter):
+            temp_app = FastAPI(title="Standalone Router")
+            temp_app.include_router(target)
+            app = temp_app
         elif callable(target) and not isinstance(target, type):
             potential_app = target()
             if isinstance(potential_app, FastAPI):
                 app = potential_app
+            elif isinstance(potential_app, APIRouter):
+                temp_app = FastAPI(title="Factory Router")
+                temp_app.include_router(potential_app)
+                app = temp_app
 
         if app is None:
             return {
                 "error": "TypeError",
-                "detail": f"Target '{app_path}' is {type(target).__name__}, expected a fastapi.FastAPI instance or factory function.",
+                "detail": f"Target '{app_path}' is {type(target).__name__}, expected a FastAPI app, APIRouter, or factory function.",
             }
 
         routes_info: list[dict[str, Any]] = []
@@ -279,3 +407,74 @@ def extract_routes(
             "error": type(e).__name__,
             "detail": str(e),
         }
+
+
+def extract_typescript(
+    target: str, project_dir: str | None = None
+) -> str | dict[str, Any]:
+    """
+    Extract and generate TypeScript interfaces/types from a Pydantic model,
+    FastAPI app, or remote OpenAPI URL.
+    """
+    # 1. Try Pydantic model first
+    if not is_http_url(target):
+        pydantic_res = extract_pydantic_schema(target, project_dir)
+        if "error" not in pydantic_res:
+            model_name = target.split(":")[-1] if ":" in target else "GeneratedModel"
+            return json_schema_to_typescript(pydantic_res, root_name=model_name)
+
+    # 2. Try OpenAPI (Local app or Remote URL)
+    openapi_res = extract_openapi(target, project_dir)
+    if "error" in openapi_res:
+        return openapi_res
+
+    # Extract all schemas from components.schemas
+    schemas = openapi_res.get("components", {}).get("schemas", {})
+    if not schemas:
+        return "// No schemas found in components.schemas"
+
+    rendered_blocks: list[str] = []
+    for schema_name, schema_dict in schemas.items():
+        if isinstance(schema_dict, dict):
+            rendered_blocks.append(
+                json_schema_to_typescript(schema_dict, root_name=schema_name)
+            )
+
+    return "\n\n".join(rendered_blocks)
+
+
+def extract_zod(target: str, project_dir: str | None = None) -> str | dict[str, Any]:
+    """
+    Extract and generate Zod schemas from a Pydantic model,
+    FastAPI app, or remote OpenAPI URL.
+    """
+    # 1. Try Pydantic model first
+    if not is_http_url(target):
+        pydantic_res = extract_pydantic_schema(target, project_dir)
+        if "error" not in pydantic_res:
+            model_name = target.split(":")[-1] if ":" in target else "GeneratedModel"
+            return json_schema_to_zod(pydantic_res, root_name=model_name)
+
+    # 2. Try OpenAPI (Local app or Remote URL)
+    openapi_res = extract_openapi(target, project_dir)
+    if "error" in openapi_res:
+        return openapi_res
+
+    schemas = openapi_res.get("components", {}).get("schemas", {})
+    if not schemas:
+        return (
+            '// import { z } from "zod";\n\n// No schemas found in components.schemas'
+        )
+
+    rendered_blocks: list[str] = ['import { z } from "zod";']
+    for schema_name, schema_dict in schemas.items():
+        if isinstance(schema_dict, dict):
+            # Render single schema without re-importing z
+            from fastapi_mcp_server.codegen import _render_single_zod_schema
+
+            defs = schema_dict.get("$defs") or schema_dict.get("definitions") or {}
+            rendered_blocks.append(
+                _render_single_zod_schema(schema_name, schema_dict, defs)
+            )
+
+    return "\n\n".join(rendered_blocks)
